@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	"zap/auth"
 	"zap/gemini"
@@ -19,35 +18,6 @@ import (
 type TaskData struct {
 	TaskList *tasksapi.TaskList
 	Tasks    []*tasksapi.Task
-}
-
-// printTaskInfo prints detailed information about a task
-func printTaskInfo(task *tasksapi.Task) {
-	fmt.Println("\n----------------------------------------")
-	fmt.Printf("Title: %s\n", task.Title)
-	fmt.Printf("ID: %s\n", task.Id)
-	fmt.Printf("Status: %s\n", task.Status)
-
-	if task.Due != "" {
-		due, _ := time.Parse(time.RFC3339, task.Due)
-		fmt.Printf("Due: %s\n", due.Format("2006-01-02 15:04:05"))
-	}
-
-	if task.Notes != "" {
-		fmt.Printf("Notes: %s\n", task.Notes)
-	}
-
-	if task.Completed != nil && *task.Completed != "" {
-		completed, _ := time.Parse(time.RFC3339, *task.Completed)
-		fmt.Printf("Completed: %s\n", completed.Format("2006-01-02 15:04:05"))
-	}
-
-	if task.Parent != "" {
-		fmt.Printf("Parent Task ID: %s\n", task.Parent)
-	}
-
-	fmt.Printf("Position: %s\n", task.Position)
-	fmt.Println("----------------------------------------")
 }
 
 func main() {
@@ -85,7 +55,7 @@ func main() {
 		log.Fatal("GEMINI_API_KEY environment variable is not set")
 	}
 
-	geminiClient, err := gemini.NewGeminiClient(geminiKey)
+	geminiClient, err := gemini.NewGeminiClient(geminiKey, taskService)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -104,6 +74,38 @@ func main() {
 
 	fmt.Println("\nTask prioritization completed successfully!")
 
+	// Automatically create subtasks for tasks in target lists
+	fmt.Printf("\nAnalyzing and creating subtasks for tasks in lists: %v\n", targetLists)
+	for _, listTitle := range targetLists {
+		taskList, err := service.GetTaskListByTitle(listTitle)
+		if err != nil {
+			log.Printf("Error finding task list %s: %v", listTitle, err)
+			continue
+		}
+
+		tasks, err := service.ListTasks(taskList.Id)
+		if err != nil {
+			log.Printf("Error fetching tasks for list %s: %v", listTitle, err)
+			continue
+		}
+
+		// Skip if no tasks in the list
+		if len(tasks) == 0 {
+			fmt.Printf("No tasks found in list: %s\n", listTitle)
+			continue
+		}
+
+		// Create subtasks using Gemini
+		err = geminiClient.AnalyzeAndCreateSubtasks(ctx, taskList.Id, tasks)
+		if err != nil {
+			log.Printf("Error creating subtasks for list %s: %v", listTitle, err)
+			continue
+		}
+		fmt.Printf("Successfully created subtasks for list: %s\n", listTitle)
+	}
+
+	fmt.Println("\nSubtask creation completed successfully!")
+
 	// Display updated task lists
 	taskLists, err := service.ListTaskLists()
 	if err != nil {
@@ -114,36 +116,4 @@ func main() {
 		fmt.Println("No task lists found.")
 		return
 	}
-
-	// Display updated tasks
-	for _, taskList := range taskLists {
-		if !contains(targetLists, taskList.Title) {
-			continue
-		}
-
-		tasks, err := service.ListTasks(taskList.Id)
-		if err != nil {
-			log.Printf("Error fetching tasks for list %s: %v", taskList.Title, err)
-			continue
-		}
-
-		fmt.Printf("\n=== Updated Task List: %s ===\n", taskList.Title)
-		if len(tasks) == 0 {
-			fmt.Println("No tasks in this list")
-			continue
-		}
-
-		for _, task := range tasks {
-			printTaskInfo(task)
-		}
-	}
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
 }

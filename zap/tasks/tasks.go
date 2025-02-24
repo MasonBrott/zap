@@ -102,3 +102,19 @@ func (s *Service) MarkTaskIncomplete(taskListID string, taskID string) (*tasksap
 	task.Status = "needsAction"
 	return s.UpdateTask(taskListID, taskID, task)
 }
+
+// GetTaskListByTitle finds a task list by its title
+func (s *Service) GetTaskListByTitle(title string) (*tasksapi.TaskList, error) {
+	taskLists, err := s.ListTaskLists()
+	if err != nil {
+		return nil, fmt.Errorf("unable to list task lists: %v", err)
+	}
+
+	for _, list := range taskLists {
+		if list.Title == title {
+			return list, nil
+		}
+	}
+
+	return nil, fmt.Errorf("task list with title '%s' not found", title)
+}

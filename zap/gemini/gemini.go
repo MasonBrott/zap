@@ -18,12 +18,19 @@ type TaskPriority struct {
 	NewPosition string  `json:"newPosition"`
 }
 
+type SubtaskSuggestion struct {
+	ParentTaskID string   `json:"parentTaskId"`
+	Subtasks     []string `json:"subtasks"`
+	Rationale    string   `json:"rationale"`
+}
+
 type GeminiClient struct {
 	client *genai.Client
 	model  *genai.GenerativeModel
+	tasks  *tasksapi.Service
 }
 
-func NewGeminiClient(apiKey string) (*GeminiClient, error) {
+func NewGeminiClient(apiKey string, tasksService *tasksapi.Service) (*GeminiClient, error) {
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
@@ -44,6 +51,7 @@ func NewGeminiClient(apiKey string) (*GeminiClient, error) {
 	return &GeminiClient{
 		client: client,
 		model:  model,
+		tasks:  tasksService,
 	}, nil
 }
 
@@ -133,6 +141,142 @@ Respond with ONLY the JSON array, no other text.`, string(taskJSON))
 	}
 
 	return priorities, nil
+}
+
+func (g *GeminiClient) SuggestSubtasks(ctx context.Context, tasks []*tasksapi.Task) ([]SubtaskSuggestion, error) {
+	// Convert tasks to a format suitable for Gemini analysis
+	taskData := make([]map[string]interface{}, len(tasks))
+	for i, task := range tasks {
+		taskData[i] = map[string]interface{}{
+			"id":     task.Id,
+			"title":  task.Title,
+			"notes":  task.Notes,
+			"parent": task.Parent, // Include parent info
+		}
+	}
+
+	// Create the prompt for Gemini
+	taskJSON, err := json.Marshal(taskData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal task data: %v", err)
+	}
+
+	prompt := fmt.Sprintf(`You are a task breakdown assistant. Analyze the following tasks and suggest logical subtasks that would help complete each task effectively. Only suggest subtasks for top-level tasks (those without a parent).
+
+Rules:
+1. Break down complex tasks into 1-3 actionable subtasks
+2. Ensure subtasks are specific and measurable
+3. Consider any details or requirements mentioned in the task notes
+4. Focus on practical implementation steps
+5. Only suggest subtasks for tasks that don't already have a parent
+6. Return ONLY a valid JSON array with no additional text
+
+Input tasks:
+%s
+
+Response format (strict JSON array):
+[
+  {
+    "parentTaskId": "task-id-1",
+    "subtasks": [
+      "Research existing solutions",
+      "Design database schema",
+      "Implement core functionality"
+    ],
+    "rationale": "Breaking down into research, design, and implementation phases for systematic approach"
+  }
+]
+
+Respond with ONLY the JSON array, no other text.`, string(taskJSON))
+
+	// Send request to Gemini
+	resp, err := g.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate content: %v", err)
+	}
+
+	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+		return nil, fmt.Errorf("no response from Gemini")
+	}
+
+	// Parse the response
+	responseText := resp.Candidates[0].Content.Parts[0].(genai.Text)
+
+	// Clean up the response text
+	cleanJSON := strings.TrimSpace(string(responseText))
+	cleanJSON = strings.TrimPrefix(cleanJSON, "```json")
+	cleanJSON = strings.TrimPrefix(cleanJSON, "```")
+	cleanJSON = strings.TrimSuffix(cleanJSON, "```")
+	cleanJSON = strings.TrimSpace(cleanJSON)
+
+	var suggestions []SubtaskSuggestion
+	if err := json.Unmarshal([]byte(cleanJSON), &suggestions); err != nil {
+		return nil, fmt.Errorf("failed to parse Gemini response: %v\nResponse was: %s", err, cleanJSON)
+	}
+
+	// Filter out tasks that already have parents
+	var topLevelTasks []*tasksapi.Task
+	for _, task := range tasks {
+		if task.Parent == "" {
+			topLevelTasks = append(topLevelTasks, task)
+		}
+	}
+
+	// Validate the response
+	if len(suggestions) != len(topLevelTasks) {
+		return nil, fmt.Errorf("received incorrect number of suggestions: got %d, want %d", len(suggestions), len(topLevelTasks))
+	}
+
+	return suggestions, nil
+}
+
+func (g *GeminiClient) CreateSubtasks(ctx context.Context, taskListId string, suggestions []SubtaskSuggestion) error {
+	for _, suggestion := range suggestions {
+		// Get the parent task to ensure it exists and get its properties
+		parentTask, err := g.tasks.Tasks.Get(taskListId, suggestion.ParentTaskID).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("failed to get parent task %s: %v", suggestion.ParentTaskID, err)
+		}
+
+		// Create each subtask
+		for _, subtaskTitle := range suggestion.Subtasks {
+			subtask := &tasksapi.Task{
+				Title:  subtaskTitle,
+				Parent: suggestion.ParentTaskID, // Explicitly set the parent ID
+				Notes:  fmt.Sprintf("Auto-generated subtask\nRationale: %s", suggestion.Rationale),
+			}
+
+			// If parent has a due date, inherit it for the subtask
+			if parentTask.Due != "" {
+				subtask.Due = parentTask.Due
+			}
+
+			// Insert the task with the parent relationship
+			insertCall := g.tasks.Tasks.Insert(taskListId, subtask)
+			insertCall.Parent(suggestion.ParentTaskID) // Set parent using the API call method
+			_, err := insertCall.Context(ctx).Do()
+			if err != nil {
+				return fmt.Errorf("failed to create subtask '%s' for parent task %s: %v", subtaskTitle, suggestion.ParentTaskID, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// AnalyzeAndCreateSubtasks combines subtask suggestion and creation into a single operation
+func (g *GeminiClient) AnalyzeAndCreateSubtasks(ctx context.Context, taskListId string, tasks []*tasksapi.Task) error {
+	suggestions, err := g.SuggestSubtasks(ctx, tasks)
+	if err != nil {
+		return fmt.Errorf("failed to suggest subtasks: %v", err)
+	}
+
+	err = g.CreateSubtasks(ctx, taskListId, suggestions)
+	if err != nil {
+		return fmt.Errorf("failed to create subtasks: %v", err)
+	}
+
+	return nil
 }
 
 func (g *GeminiClient) Close() {
