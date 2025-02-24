@@ -55,7 +55,7 @@ func main() {
 		log.Fatal("GEMINI_API_KEY environment variable is not set")
 	}
 
-	geminiClient, err := gemini.NewGeminiClient(geminiKey, taskService)
+	geminiClient, err := gemini.NewGeminiClient(geminiKey, taskService, "gemini-2.0-flash-thinking-exp-01-21")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -95,9 +95,34 @@ func main() {
 			continue
 		}
 
+		// Count top-level tasks and tasks with subtasks
+		topLevelCount := 0
+		hasSubtasksCount := 0
+		for _, task := range tasks {
+			if task.Parent == "" {
+				topLevelCount++
+				// Check if this task has any subtasks
+				for _, t := range tasks {
+					if t.Parent == task.Id {
+						hasSubtasksCount++
+						break
+					}
+				}
+			}
+		}
+
+		fmt.Printf("\nIn list '%s':\n", listTitle)
+		fmt.Printf("- Found %d top-level tasks\n", topLevelCount)
+		fmt.Printf("- %d tasks already have subtasks\n", hasSubtasksCount)
+		fmt.Printf("- Will generate subtasks for %d tasks\n", topLevelCount-hasSubtasksCount)
+
 		// Create subtasks using Gemini
 		err = geminiClient.AnalyzeAndCreateSubtasks(ctx, taskList.Id, tasks)
 		if err != nil {
+			if err.Error() == "no tasks found that need subtasks" {
+				fmt.Printf("All tasks in list '%s' already have subtasks. Skipping.\n", listTitle)
+				continue
+			}
 			log.Printf("Error creating subtasks for list %s: %v", listTitle, err)
 			continue
 		}

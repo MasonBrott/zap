@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"zap/gemini"
 
@@ -30,87 +29,55 @@ type taskWithPriority struct {
 	priority float64
 }
 
-// ReorderTasksByPriority fetches tasks from specified lists and reorders them based on Gemini analysis
+// ReorderTasksByPriority reorders tasks in the specified lists based on AI analysis
 func (p *Prioritizer) ReorderTasksByPriority(ctx context.Context, targetLists []string) error {
-	// Get all task lists
-	taskLists, err := p.service.ListTaskLists()
-	if err != nil {
-		return fmt.Errorf("failed to list task lists: %v", err)
-	}
+	for _, listTitle := range targetLists {
+		taskList, err := p.service.GetTaskListByTitle(listTitle)
+		if err != nil {
+			return fmt.Errorf("error finding task list %s: %v", listTitle, err)
+		}
 
-	// Filter and process target lists
-	var allTasks []*tasksapi.Task
-	taskListMap := make(map[string]*tasksapi.TaskList) // Map task list ID to task list
-	taskToListMap := make(map[string]string)           // Map task ID to its task list ID
+		tasks, err := p.service.ListTasks(taskList.Id)
+		if err != nil {
+			return fmt.Errorf("error fetching tasks for list %s: %v", listTitle, err)
+		}
 
-	for _, list := range taskLists {
-		if !shouldProcessList(list.Title, targetLists) {
+		// Filter out subtasks - only process top-level tasks
+		var topLevelTasks []*tasksapi.Task
+		for _, task := range tasks {
+			if task.Parent == "" {
+				topLevelTasks = append(topLevelTasks, task)
+			}
+		}
+
+		// Skip if no top-level tasks in the list
+		if len(topLevelTasks) == 0 {
+			fmt.Printf("No top-level tasks found in list: %s\n", listTitle)
 			continue
 		}
 
-		tasks, err := p.service.ListTasks(list.Id)
+		// Get priorities from Gemini
+		priorities, err := p.gemini.AnalyzeAndPrioritizeTasks(ctx, topLevelTasks)
 		if err != nil {
-			return fmt.Errorf("failed to list tasks for %s: %v", list.Title, err)
+			return fmt.Errorf("error analyzing tasks for list %s: %v", listTitle, err)
 		}
 
-		// Store task list and create mappings
-		taskListMap[list.Id] = list
-		for _, task := range tasks {
-			allTasks = append(allTasks, task)
-			taskToListMap[task.Id] = list.Id
-		}
-	}
-
-	if len(allTasks) == 0 {
-		return fmt.Errorf("no tasks found in the specified lists")
-	}
-
-	// Get priority analysis from Gemini
-	priorities, err := p.gemini.AnalyzeAndPrioritizeTasks(ctx, allTasks)
-	if err != nil {
-		return fmt.Errorf("failed to analyze tasks: %v", err)
-	}
-
-	// Group tasks by list and combine with priorities
-	tasksByList := make(map[string][]taskWithPriority)
-	for _, task := range allTasks {
-		listID := taskToListMap[task.Id]
-		priority := getPriorityForTask(task.Id, priorities)
-		tasksByList[listID] = append(tasksByList[listID], taskWithPriority{
-			task:     task,
-			priority: priority,
-		})
-	}
-
-	// Update each list separately
-	for listID, tasksWithPriority := range tasksByList {
-		// Sort tasks by priority (highest first)
-		sort.Slice(tasksWithPriority, func(i, j int) bool {
-			return tasksWithPriority[i].priority > tasksWithPriority[j].priority
+		// Sort priorities by position
+		sort.Slice(priorities, func(i, j int) bool {
+			return priorities[i].NewPosition < priorities[j].NewPosition
 		})
 
-		// Move highest priority task to the top first
-		highestPriorityTask := tasksWithPriority[0].task
-		_, err := p.service.MoveTask(listID, highestPriorityTask.Id, "")
-		if err != nil {
-			return fmt.Errorf("failed to move task %s to top in list %s: %v",
-				highestPriorityTask.Title, taskListMap[listID].Title, err)
-		}
-
-		// Move remaining tasks in order
-		for i := 1; i < len(tasksWithPriority); i++ {
-			currentTask := tasksWithPriority[i].task
-			previousTask := tasksWithPriority[i-1].task
-
-			_, err := p.service.MoveTask(listID, currentTask.Id, previousTask.Id)
+		// Apply the new order
+		var previousTaskID string
+		for _, priority := range priorities {
+			_, err := p.service.MoveTask(taskList.Id, priority.TaskID, previousTaskID)
 			if err != nil {
-				return fmt.Errorf("failed to move task %s after %s in list %s: %v",
-					currentTask.Title, previousTask.Title, taskListMap[listID].Title, err)
+				return fmt.Errorf("error moving task %s: %v", priority.TaskID, err)
 			}
-
-			// Add a small delay to ensure order is preserved
-			time.Sleep(100 * time.Millisecond)
+			previousTaskID = priority.TaskID
 		}
+
+		fmt.Printf("Successfully prioritized %d tasks in list: %s\n", len(priorities), listTitle)
 	}
 
 	return nil
